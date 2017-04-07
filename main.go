@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/ghodss/yaml"
@@ -14,7 +16,10 @@ import (
 	"k8s.io/helm/cmd/helm/strvals"
 	"k8s.io/helm/pkg/chartutil"
 	"k8s.io/helm/pkg/engine"
+	"k8s.io/helm/pkg/hooks"
 	"k8s.io/helm/pkg/proto/hapi/chart"
+	"k8s.io/helm/pkg/proto/hapi/release"
+	util "k8s.io/helm/pkg/releaseutil"
 	"k8s.io/helm/pkg/timeconv"
 )
 
@@ -95,16 +100,20 @@ func run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	for name, data := range out {
-		b := filepath.Base(name)
+  // out is a map[string]string{}
+  // func sortManifests(files map[string]string, apis chartutil.VersionSet, sort SortOrder) ([]*release.Hook, []manifest, error) {
+  _, manifests, err := sortManifests(out, chartutil.DefaultVersionSet, InstallOrder)
+
+  for _, m := range manifests {
+		b := filepath.Base(m.name)
 		if !showNotes && b == "NOTES.txt" {
 			continue
 		}
 		if strings.HasPrefix(b, "_") {
 			continue
 		}
-		fmt.Printf("---\n# Source: %s\n", name)
-		fmt.Println(data)
+		fmt.Printf("---\n# Source: %s\n", m.name)
+		fmt.Println(m.content)
 	}
 	return nil
 }
@@ -186,4 +195,186 @@ func (v *valueFiles) Set(value string) error {
 		*v = append(*v, filePath)
 	}
 	return nil
+}
+
+
+// pkg/tiller/hooks.go
+var events = map[string]release.Hook_Event{
+	hooks.PreInstall:         release.Hook_PRE_INSTALL,
+	hooks.PostInstall:        release.Hook_POST_INSTALL,
+	hooks.PreDelete:          release.Hook_PRE_DELETE,
+	hooks.PostDelete:         release.Hook_POST_DELETE,
+	hooks.PreUpgrade:         release.Hook_PRE_UPGRADE,
+	hooks.PostUpgrade:        release.Hook_POST_UPGRADE,
+	hooks.PreRollback:        release.Hook_PRE_ROLLBACK,
+	hooks.PostRollback:       release.Hook_POST_ROLLBACK,
+	hooks.ReleaseTestSuccess: release.Hook_RELEASE_TEST_SUCCESS,
+	hooks.ReleaseTestFailure: release.Hook_RELEASE_TEST_FAILURE,
+}
+
+// manifest represents a manifest file, which has a name and some content.
+type manifest struct {
+	name    string
+	content string
+	head    *util.SimpleHead
+}
+
+// sortManifests takes a map of filename/YAML contents and sorts them into hook types.
+//
+// The resulting hooks struct will be populated with all of the generated hooks.
+// Any file that does not declare one of the hook types will be placed in the
+// 'generic' bucket.
+//
+// To determine hook type, this looks for a YAML structure like this:
+//
+//  kind: SomeKind
+//  apiVersion: v1
+// 	metadata:
+//		annotations:
+//			helm.sh/hook: pre-install
+//
+// Where HOOK_NAME is one of the known hooks.
+//
+// If a file declares more than one hook, it will be copied into all of the applicable
+// hook buckets. (Note: label keys are not unique within the labels section).
+//
+// Files that do not parse into the expected format are simply placed into a map and
+// returned.
+func sortManifests(files map[string]string, apis chartutil.VersionSet, sort SortOrder) ([]*release.Hook, []manifest, error) {
+	hs := []*release.Hook{}
+	generic := []manifest{}
+
+	for n, c := range files {
+		// Skip partials. We could return these as a separate map, but there doesn't
+		// seem to be any need for that at this time.
+		if strings.HasPrefix(path.Base(n), "_") {
+			continue
+		}
+		// Skip empty files, and log this.
+		if len(strings.TrimSpace(c)) == 0 {
+			continue
+		}
+
+		var sh util.SimpleHead
+		err := yaml.Unmarshal([]byte(c), &sh)
+
+		if err != nil {
+			e := fmt.Errorf("YAML parse error on %s: %s", n, err)
+			return hs, generic, e
+		}
+
+		if sh.Version != "" && !apis.Has(sh.Version) {
+			return hs, generic, fmt.Errorf("apiVersion %q in %s is not available", sh.Version, n)
+		}
+
+		if sh.Metadata == nil || sh.Metadata.Annotations == nil || len(sh.Metadata.Annotations) == 0 {
+			generic = append(generic, manifest{name: n, content: c, head: &sh})
+			continue
+		}
+
+		hookTypes, ok := sh.Metadata.Annotations[hooks.HookAnno]
+		if !ok {
+			generic = append(generic, manifest{name: n, content: c, head: &sh})
+			continue
+		}
+		h := &release.Hook{
+			Name:     sh.Metadata.Name,
+			Kind:     sh.Kind,
+			Path:     n,
+			Manifest: c,
+			Events:   []release.Hook_Event{},
+		}
+
+		isHook := false
+		for _, hookType := range strings.Split(hookTypes, ",") {
+			hookType = strings.ToLower(strings.TrimSpace(hookType))
+			e, ok := events[hookType]
+			if ok {
+				isHook = true
+				h.Events = append(h.Events, e)
+			}
+		}
+
+		if !isHook {
+			continue
+		}
+		hs = append(hs, h)
+	}
+	return hs, sortByKind(generic, sort), nil
+}
+
+
+
+// pkg/tiller/kind_sorter.go
+
+// SortOrder is an ordering of Kinds.
+type SortOrder []string
+
+// InstallOrder is the order in which manifests should be installed (by Kind).
+var InstallOrder SortOrder = []string{
+  "Project",
+	"Secret",
+	"ConfigMap",
+	"PersistentVolume",
+	"PersistentVolumeClaim",
+	"ServiceAccount",
+	"ClusterRole",
+	"ClusterRoleBinding",
+	"Role",
+	"RoleBinding",
+  "ImageStream",
+	"Service",
+  "BuildConfig",
+	"Pod",
+	"ReplicationController",
+	"Deployment",
+  "DeploymentConfig",
+	"DaemonSet",
+	"Ingress",
+	"Job",
+}
+
+// sortByKind does an in-place sort of manifests by Kind.
+//
+// Results are sorted by 'ordering'
+func sortByKind(manifests []manifest, ordering SortOrder) []manifest {
+	ks := newKindSorter(manifests, ordering)
+	sort.Sort(ks)
+	return ks.manifests
+}
+
+type kindSorter struct {
+	ordering  map[string]int
+	manifests []manifest
+}
+
+func newKindSorter(m []manifest, s SortOrder) *kindSorter {
+	o := make(map[string]int, len(s))
+	for v, k := range s {
+		o[k] = v
+	}
+
+	return &kindSorter{
+		manifests: m,
+		ordering:  o,
+	}
+}
+
+func (k *kindSorter) Len() int { return len(k.manifests) }
+
+func (k *kindSorter) Swap(i, j int) { k.manifests[i], k.manifests[j] = k.manifests[j], k.manifests[i] }
+
+func (k *kindSorter) Less(i, j int) bool {
+	a := k.manifests[i]
+	b := k.manifests[j]
+	first, ok := k.ordering[a.head.Kind]
+	if !ok {
+		// Unknown is always last
+		return false
+	}
+	second, ok := k.ordering[b.head.Kind]
+	if !ok {
+		return true
+	}
+	return first < second
 }
